@@ -79,7 +79,3 @@ O script nao mexe na interface `wlan0` (Wi-Fi interno), a menos que voce a selec
   com NetworkManager.
 - "Scan failed - no CSV": confirme que `airodump-ng` esta instalado.
 - Falha ao converter hashes: instale `hcxtools` e/ou `cap2hccapx`.
-
-## Licenca
-
-Defina aqui a licenca do projeto (ex.: MIT, GPL-3.0, etc.).
